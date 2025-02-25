@@ -171,4 +171,23 @@ docker run --rm --gpus all nvidia/cuda:12.1.1-devel-ubuntu22.04 nvidia-smi
 
 It will check if there is a gpu toolkit for docker and if there isn't it will resort to installing it for you (about 2GB).
 
-### Step 8: 
+If it didn't resort to installing it try:
+
+```powershell
+docker pull nvidia/cuda:12.1.1-base-ubuntu22.04
+```
+
+The install should complete and then you should run `nvidia-smi` in the container:
+
+```powershell
+docker run --rm --gpus all nvidia/cuda:12.1.1-base-ubuntu22.04 nvidia-smi
+```
+
+If it prints out the chart of GPUs on your system **in the container** we are looking solid!
+
+### Step 8: Spinning the container
+
+1. Under VS Code choose the `Docker` icon on the left sidebar
+2. Choose the `+` icon next to `CONTAINERS` and pick `Open Folder in a Container`
+3. Navigate to the `.devcontainer` folder of your project and click `Open`
+4. 

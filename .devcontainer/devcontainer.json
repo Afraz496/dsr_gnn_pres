@@ -2,6 +2,9 @@
   "name": "TGNN Dev Container",
   "dockerFile": "Dockerfile",
   "runArgs": ["--gpus", "all"],
+  "mounts": [
+    "source=u:/DSR/dsr_gnn_pres,target=/workspaces/dsr_gnn_pres,type=bind"
+],
   "settings": {
     "terminal.integrated.defaultProfile.linux": "bash"
   },
@@ -12,4 +15,6 @@
   "forwardPorts": [8888],
   "postCreateCommand": "pip install -r requirements.txt",
   "remoteUser": "root"
+  
 }
+
