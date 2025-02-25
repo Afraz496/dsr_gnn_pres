@@ -4,7 +4,7 @@ This markdown file provides detailed instructions on how to setup Tensorflow wit
 
 | **Feature**               | **Value**                                               |
 |---------------------------|---------------------------------------------------------|
-| **Platform**                  | Windows 10 Enterprise Edition PC with admin rights  |
+| **Platform**                  | Windows 10 Enterprise Edition PC with **admin rights**  |
 | **Date**                      | 24th February, 2025                                 |
 | **NVIDIA GPU** 🟩             | Quadro P2000                                        |
 | **PyTorch version**           | 2.1.0+cu121                                         |
@@ -151,4 +151,24 @@ torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 dgl-cu121 -f https://data.dgl.ai/wheels/cu121/repo.html
 ```
 
-### Step 7: 
+### Step 7: Configure your GPU with Docker
+
+**Note**: This step will cause your system to freeze a lot, this is normal
+
+Before you begin running docker commands, run the Windows Powershell to confirm everything works:
+
+```powershell
+docker info
+```
+
+If this outputs something and you don't see: `Cannot connect to the Docker daemon` then you will need to reinstall and follow steps 3-6 again.
+
+If it works open VS Code and do `Terminal > New Terminal`:
+
+```powershell
+docker run --rm --gpus all nvidia/cuda:12.1.1-devel-ubuntu22.04 nvidia-smi
+```
+
+It will check if there is a gpu toolkit for docker and if there isn't it will resort to installing it for you (about 2GB).
+
+### Step 8: 
