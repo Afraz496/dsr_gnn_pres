@@ -10,6 +10,8 @@ import dash
 from dash import dcc, html
 from dash.dependencies import Input, Output
 import dash_cytoscape as cyto
+import dash_leaflet as dl
+import datetime
 
 # Dictionary of Hungarian counties with their approximate latitude and longitude
 county_coordinates = {
@@ -34,7 +36,6 @@ county_coordinates = {
     'Zala': (46.8333, 16.8333),
     'Budapest': (47.497913, 19.040236),
 }
-
 
 def normalize_coordinates(lat, lon, width=500, height=500):
     # Normalize latitude and longitude to fit in a given width and height
@@ -112,43 +113,67 @@ def prepare_cytoscape_data(G, predictions, time_step):
     edges = [{'data': {'source': str(edge[0]), 'target': str(edge[1])}} for edge in G.edges]
     return nodes + edges
 
-# Step 7: Build Interactive Dashboard
+# Convert time steps to real dates
+def generate_time_labels(start_year=2004, num_steps=500):
+    start_date = datetime.date(start_year, 1, 1)
+    dates = [start_date + datetime.timedelta(weeks=i) for i in range(num_steps)]
+    return {i: date.strftime('%B %Y') for i, date in enumerate(dates)}
+
 def create_dashboard(predictions_over_time, dataset, max_cases):
     app = dash.Dash(__name__)
-
     total_steps = len(predictions_over_time)
-    tick_spacing = max(total_steps // 12, 1)
-    slider_marks = {i: f'Time {i}' if i % tick_spacing == 0 else '' for i in range(total_steps)}
+    time_labels = generate_time_labels(start_year=2004, num_steps=total_steps)
 
-    snapshot = dataset[0]  # Use the first snapshot for positions
-    num_nodes = snapshot.x.shape[0]
+    # Pre-compute the positions for counties once
+    positions = {county: normalize_coordinates(lat, lon) for county, (lat, lon) in county_coordinates.items()}
 
-    # Precompute node positions based on county coordinates
-    positions = {}
-    for county, (lat, lon) in county_coordinates.items():
-        positions[county] = normalize_coordinates(lat, lon)
+    # Space out the time slider ticks by displaying every 10th label
+    step_size = max(1, total_steps // 10)
+    time_slider_marks = {i: time_labels[i] for i in range(0, total_steps, step_size) if i < total_steps}
 
-    app.layout = html.Div([  
-        html.H1("Temporal GNN Visualization"),
-        cyto.Cytoscape(
-            id='cytoscape-graph',
-            elements=[],
-            layout={'name': 'preset'},  
-            style={'width': '100%', 'height': '600px'},
-            stylesheet=[
-                {'selector': 'node', 'style': {'label': 'data(label)', 'font-size': '10px'}},  
-                {'selector': 'edge', 'style': {'curve-style': 'bezier', 'target-arrow-shape': 'triangle'}}  
-            ]
-        ),
+    app.layout = html.Div([ 
+        html.H1("Temporal GNN Visualization", style={'textAlign': 'center'}),
+
+        # Container for the map and the graph side by side
+        html.Div([
+            # Left side: Map (Leaflet)
+            html.Div(
+                dl.Map(
+                    [
+                        dl.TileLayer(url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"),  # Explicit tile layer
+                        dl.Polygon(
+                            positions=[list(reversed(coord)) for coord in county_coordinates.values()],
+                            color='blue', fill=True, fillOpacity=0.3
+                        )
+                    ],
+                    center=[37.7749, -122.4194],  # Set map center to a known location (e.g., San Francisco)
+                    zoom=5,  # Adjust the zoom level
+                    style={'width': '100%', 'height': '500px'}, id='map'
+                ),
+                style={'width': '50%', 'display': 'inline-block'}
+            ),
+
+            # Right side: Graph (Cytoscape)
+            html.Div(
+                cyto.Cytoscape(
+                    id='cytoscape-graph',
+                    elements=[],  # We will update this dynamically
+                    layout={'name': 'preset'},
+                    style={'width': '100%', 'height': '500px'}
+                ),
+                style={'width': '50%', 'display': 'inline-block'}
+            )
+        ], style={'display': 'flex', 'flexDirection': 'row', 'justifyContent': 'space-between'}),
+
+        # Time slider to control the graph updates
         dcc.Slider(
             id='time-slider',
-            min=0,
-            max=total_steps - 1,
-            step=1,
-            value=0,
-            marks=slider_marks
+            min=0, max=total_steps - 1, step=1, value=0,
+            marks=time_slider_marks  # Spaced out time ticks
         ),
-        html.Div(id='info-output', style={'marginTop': 20, 'fontSize': '16px'}),  
+
+        # Info section to display the current time and clicked node/edge info
+        html.Div(id='info-output', style={'marginTop': 20, 'fontSize': '16px'})
     ])
 
     @app.callback(
@@ -159,46 +184,51 @@ def create_dashboard(predictions_over_time, dataset, max_cases):
         snapshot = dataset[time_index]
         node_values = np.clip((snapshot.x.numpy() * max_cases), 0, None).astype(int)
 
-        # Create nodes with positions
+        # Generate nodes with their predicted values
         nodes = [
-            {
-                'data': {'id': county, 'label': f'{county}: {node_values[i, 0]} cases'},
-                'position': positions[county]  
-            }
+            {'data': {'id': county, 'label': f'{county}: {node_values[i, 0]} cases'},
+             'position': positions[county]}
             for i, county in enumerate(county_coordinates.keys())
         ]
-
+        
+        # Generate edges from the snapshot
         edges = [
-            {
-                'data': {
-                    'source': list(county_coordinates.keys())[src],
-                    'target': list(county_coordinates.keys())[dst],
-                    'weight': w if snapshot.edge_attr is not None else 1  
-                }
-            }
-            for src, dst, w in zip(
-                snapshot.edge_index[0].numpy(),
-                snapshot.edge_index[1].numpy(),
-                snapshot.edge_attr.numpy() if snapshot.edge_attr is not None else [1] * len(snapshot.edge_index[0])
-            )
-            if src < len(county_coordinates) and dst < len(county_coordinates)  
+            {'data': {'source': list(county_coordinates.keys())[src], 'target': list(county_coordinates.keys())[dst]}}
+            for src, dst in zip(snapshot.edge_index[0].numpy(), snapshot.edge_index[1].numpy())
         ]
-
+        
+        # Combine nodes and edges into the elements list
         return nodes + edges
 
     @app.callback(
         Output('info-output', 'children'),
         Input('cytoscape-graph', 'tapNodeData'),
-        Input('cytoscape-graph', 'tapEdgeData')
+        Input('cytoscape-graph', 'tapEdgeData'),
+        Input('time-slider', 'value')
     )
-    def display_click_info(node_data, edge_data):
+    def display_click_info(node_data, edge_data, time_index):
+        # Display the current time based on the slider value
+        current_time = time_labels.get(time_index, "Unknown")
+
+        # If a node is clicked, display true vs predicted values
         if node_data:
-            return f"Node clicked: {node_data['id']}, Label: {node_data['label']}"
+            county = node_data['id']
+            predicted_cases = int(node_data['label'].split(': ')[1].split(' ')[0])  # Extract predicted cases from label
+
+            # Fetch the true value from the dataset (assuming dataset has true values)
+            true_cases = dataset[time_index].y.numpy()[list(county_coordinates.keys()).index(county)]  # Get true value for the county
+            
+            return f"Current time: {current_time} | Node clicked: {county} | True cases: {true_cases} | Predicted cases: {predicted_cases}"
+
+        # If an edge is clicked, show edge information
         elif edge_data:
-            return f"Edge clicked: Source {edge_data['source']} → Target {edge_data['target']}, Weight: {edge_data['weight']:.2f}"
-        return "Click on a node or edge to see more details."
+            return f"Edge clicked: Source {edge_data['source']} → Target {edge_data['target']}"
+
+        # Default message when nothing is clicked
+        return f"Current time: {current_time} | Click on a node or edge to see more details."
 
     return app
+
 
 # Main Function
 def main():
