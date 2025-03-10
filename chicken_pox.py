@@ -23,10 +23,6 @@ def normalize_coordinates(lat, lon, width=500, height=500):
     y = (max_lat - lat) / (max_lat - min_lat) * height
     return {'x': x, 'y': y}
 
-def extract_node_names(dataset):
-    # Assuming each snapshot has a feature for each county in the dataset
-    return [f"County {i}" for i in range(len(dataset[0].x))]
-
 # Load raw data
 def load_raw_data():
     df = pd.read_csv('hungary_chickenpox.csv')
@@ -48,71 +44,19 @@ county_coordinates = {
     'ZALA': (46.8333, 16.8333), 'BUDAPEST': (47.497913, 19.040236)
 }
 
-def inverse_transform(scaled_values, original_values):
-    min_val, max_val = original_values.min(), original_values.max()
-    return scaled_values * (max_val - min_val) + min_val
+def get_dataset_snapshots(dataset):
+    """Convert the iterable dataset to a list of snapshots"""
+    snapshots = []
+    for snapshot in dataset:
+        snapshots.append(snapshot)
+    return snapshots
 
-class TemporalGNN(torch.nn.Module):
-    def __init__(self, node_features, hidden_dim=32):
-        super(TemporalGNN, self).__init__()
-        self.conv1 = GCNConv(node_features, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.linear = torch.nn.Linear(hidden_dim, 1)
-        
-    def forward(self, x, edge_index):
-        h1 = F.relu(self.conv1(x, edge_index))
-        h2 = F.relu(self.conv2(h1, edge_index))
-        return self.linear(h2)
-
-def train_model(dataset, epochs=50):
-    train_dataset, _ = temporal_signal_split(dataset, train_ratio=0.8)
-    model = TemporalGNN(node_features=4)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    model.train()
-
-    for epoch in range(epochs):
-        for snapshot in train_dataset:
-            y_hat = model(snapshot.x, snapshot.edge_index)
-            loss = torch.mean((y_hat - snapshot.y)**2)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-    return model
-
-def get_predictions_over_time(model, dataset, original_df):
-    model.eval()
-    predictions_over_time = []
-    with torch.no_grad():
-        for idx, snapshot in enumerate(dataset):
-            y_hat = model(snapshot.x, snapshot.edge_index).numpy().flatten()
-            original_values = original_df.iloc[idx][csv_counties].values
-            predictions_over_time.append(inverse_transform(y_hat, original_values))
-    return predictions_over_time
-
-# Step 5: Create a NetworkX graph for visualization
-def create_graph(snapshot):
-    G = nx.Graph()
-    edge_index = snapshot.edge_index.numpy()
-    for src, dst in zip(edge_index[0], edge_index[1]):
-        G.add_edge(src, dst)
-    return G
-
-# Step 6: Prepare Dash Cytoscape Data
-def prepare_cytoscape_data(G, predictions, time_step):
-    nodes = [{'data': {'id': str(node), 'label': f"Node {node}", 'prediction': predictions[node]}} 
-             for node in G.nodes]
-    edges = [{'data': {'source': str(edge[0]), 'target': str(edge[1])}} for edge in G.edges]
-    return nodes + edges
-
-# Convert time steps to real dates
-def generate_time_labels(start_year=2004, num_steps=500):
-    start_date = datetime.date(start_year, 1, 1)
-    dates = [start_date + datetime.timedelta(weeks=i) for i in range(num_steps)]
-    return {i: date.strftime('%B %Y') for i, date in enumerate(dates)}
-
-def create_dashboard(predictions_over_time, dataset, inverse_transformer):
+def create_dashboard(dataset, raw_data):
+    # Convert dataset to a list of snapshots for direct indexing
+    snapshots = get_dataset_snapshots(dataset)
+    total_steps = len(snapshots)
+    
     app = dash.Dash(__name__)
-    total_steps = len(predictions_over_time)
     time_labels = generate_time_labels(start_year=2005, num_steps=total_steps)
 
     positions = {county: normalize_coordinates(lat, lon) for county, (lat, lon) in county_coordinates.items()}
@@ -121,21 +65,20 @@ def create_dashboard(predictions_over_time, dataset, inverse_transformer):
     time_slider_marks = {i: time_labels[i] for i in range(0, total_steps, step_size) if i < total_steps}
 
     app.layout = html.Div([ 
-        html.H1("Temporal GNN Visualization", style={'textAlign': 'center'}),
+        html.H1("Hungary Chickenpox Cases - Temporal GNN Visualization", style={'textAlign': 'center'}),
 
         html.Div([
             html.Div(
                 dl.Map(
                     [
                         dl.TileLayer(url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"),
-                        dl.Polygon(
-                            positions=[list(reversed(coord)) for coord in county_coordinates.values()],
-                            color='blue', fill=True, fillOpacity=0.3
-                        )
+                        # Use a LayerGroup instead of MarkerCluster
+                        dl.LayerGroup(id='markers')
                     ],
                     center=[47.1625, 19.5033],
                     zoom=7,
-                    style={'width': '100%', 'height': '500px'}, id='map'
+                    style={'width': '100%', 'height': '500px'}, 
+                    id='map'
                 ),
                 style={'width': '50%', 'display': 'inline-block'}
             ),
@@ -151,11 +94,18 @@ def create_dashboard(predictions_over_time, dataset, inverse_transformer):
                             'selector': 'node',
                             'style': {
                                 'label': 'data(label)',
+                                'background-color': 'data(color)',
                                 'font-size': '8px',
-                                'text-transform': 'capitalize',
+                                'text-wrap': 'wrap',
                                 'width': '50px',
                                 'height': '50px',
                                 'padding': '8px'
+                            }
+                        },
+                        {
+                            'selector': 'edge',
+                            'style': {
+                                'width': 1
                             }
                         }
                     ]
@@ -174,68 +124,123 @@ def create_dashboard(predictions_over_time, dataset, inverse_transformer):
     ])
 
     @app.callback(
-        Output('cytoscape-graph', 'elements'),
+        [Output('cytoscape-graph', 'elements'),
+         Output('markers', 'children')],
         Input('time-slider', 'value')
     )
     def update_graph(time_index):
-        snapshot = dataset[time_index]
-        node_values = inverse_transformer(snapshot.x.numpy()).astype(int)
-
-
-        nodes = [
-            {'data': {'id': county, 'label': f'{county}: {node_values[i, 0]} cases'},
-             'position': positions[county]}
-            for i, county in enumerate(county_coordinates.keys())
+        snapshot = snapshots[time_index]
+        
+        # Get the original data for this time step from the raw dataset
+        time_date = time_labels[time_index].split(' ')
+        month, year = time_date[0], int(time_date[1])
+        
+        # Filter raw data for this time step
+        raw_data_filtered = raw_data[
+            (raw_data['Date'].dt.month == datetime.datetime.strptime(month, "%B").month) & 
+            (raw_data['Date'].dt.year == year)
         ]
-
-        edges = [
-            {'data': {'source': list(county_coordinates.keys())[src], 'target': list(county_coordinates.keys())[dst]}}
-            for src, dst in zip(snapshot.edge_index[0].numpy(), snapshot.edge_index[1].numpy())
-        ]
-
-        return nodes + edges
+        
+        # If we have data for this time step, use it
+        if not raw_data_filtered.empty:
+            true_cases = raw_data_filtered[csv_counties].values[0]
+        else:
+            # Use a default or placeholder value
+            true_cases = np.zeros(len(csv_counties))
+        
+        # Create color mapping based on case counts
+        max_cases = max(np.max(true_cases), 1)  # Prevent division by zero
+        
+        # Generate colors based on intensity (red for higher cases)
+        def get_color(cases):
+            intensity = min(cases / max_cases, 1.0)
+            r = int(255 * intensity)
+            g = int(100 * (1 - intensity))
+            b = int(100 * (1 - intensity))
+            return f'rgb({r},{g},{b})'
+        
+        # Create network graph nodes
+        nodes = []
+        markers = []
+        
+        for i, county in enumerate(csv_counties):
+            # Get true case count from raw data
+            true_case_count = int(true_cases[i])
+            color = get_color(true_case_count)
+            
+            # Create cytoscape node
+            nodes.append({
+                'data': {
+                    'id': county,
+                    'label': f'{county}\n{true_case_count} cases',
+                    'color': color
+                },
+                'position': positions[county]
+            })
+            
+            # Create map marker
+            lat, lon = county_coordinates[county]
+            markers.append(
+                dl.Marker(
+                    position=[lat, lon],
+                    children=[
+                        dl.Tooltip(f"{county}: {true_case_count} cases")
+                    ]
+                )
+            )
+        
+        # Create edges based on geographical proximity
+        edges = []
+        for i, county1 in enumerate(csv_counties):
+            for j, county2 in enumerate(csv_counties):
+                if i < j:  # Avoid duplicate edges
+                    lat1, lon1 = county_coordinates[county1]
+                    lat2, lon2 = county_coordinates[county2]
+                    # Calculate distance
+                    distance = ((lat1 - lat2)**2 + (lon1 - lon2)**2)**0.5
+                    # Connect nodes if they're close enough (threshold can be adjusted)
+                    if distance < 1.0:  # Approximately 100km
+                        edges.append({
+                            'data': {
+                                'source': county1,
+                                'target': county2
+                            }
+                        })
+        
+        return nodes + edges, markers
 
     @app.callback(
         Output('info-output', 'children'),
-        Input('cytoscape-graph', 'tapNodeData'),
-        Input('cytoscape-graph', 'elements'),
-        Input('time-slider', 'value')
+        [Input('cytoscape-graph', 'tapNodeData'),
+         Input('time-slider', 'value')]
     )
-    def display_click_info(node_data, elements, time_index):
+    def display_click_info(node_data, time_index):
         current_time = time_labels.get(time_index, "Unknown")
 
         if node_data:
             county = node_data['id']
-            predicted_cases = int(node_data['label'].split(': ')[1].split(' ')[0])
-            true_cases = int(inverse_transformer(dataset[time_index].y.numpy())[list(county_coordinates.keys()).index(county)])
+            cases = node_data['label'].split('\n')[1].split(' ')[0]
+            return f"Current time: {current_time} | County: {county} | Reported cases: {cases}"
 
-
-            return f"Current time: {current_time} | Node clicked: {county} | True cases: {true_cases} | Predicted cases: {predicted_cases}"
-
-        return f"Current time: {current_time} | Click on a node or edge to see more details."
+        return f"Current time: {current_time} | Click on a county to see case details."
 
     return app
 
-
+# Convert time steps to real dates
+def generate_time_labels(start_year=2004, num_steps=500):
+    start_date = datetime.date(start_year, 1, 1)
+    dates = [start_date + datetime.timedelta(weeks=i) for i in range(num_steps)]
+    return {i: date.strftime('%B %Y') for i, date in enumerate(dates)}
 
 # Main Function
 def main():
+    # Load the dataset
     raw_data = load_raw_data()
     loader = ChickenpoxDatasetLoader()
     dataset = loader.get_dataset()
-    model = train_model(dataset)
-    predictions_over_time = get_predictions_over_time(model, dataset, raw_data)
-    all_features = torch.cat([snapshot.x for snapshot in dataset], dim=0)  
-    # https://archive.ics.uci.edu/dataset/580/hungarian+chickenpox+cases
-    max_cases = 479
-    min_cases = all_features.min().item()
-    print(max_cases)  
-    all_true_values = torch.cat([snapshot.y for snapshot in dataset], dim=0).numpy()
-
-    # Define the inverse_transformer as a lambda for easy passing
-    inverse_transformer = lambda scaled_values: inverse_transform(scaled_values, all_true_values)
-
-    app = create_dashboard(predictions_over_time, dataset, inverse_transformer)  
+    
+    # Create the dashboard with dataset snapshots
+    app = create_dashboard(dataset, raw_data)
     app.run_server(debug=True)
 
 if __name__ == "__main__":
