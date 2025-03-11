@@ -56,8 +56,6 @@ Then you should see:
 
 If you made it this far, well done! You now have a tucked away virtual environment ready for a lot of software.
 
-The first thing we need to do now is install
-
 ## Docker 🐳
 
 Dockerizing your project is a great way to freeze the development environment. It has the added benefit of being a more reproducible mechanism to ensure people working on your project do not have to struggle with packages/versioning etc. This is not your typical run of the mill Docker installation guide and actually includes a little bit of how-tos so you don't get lost in the installation.
@@ -225,3 +223,18 @@ nvidia-smi
 ```
 
 **Note**: This command will show a much higher version than what is installed, that is normal -> it is not indicative of the highest or lowest version supported, rather the version at the time this GPU was made.
+
+## Installing packages
+
+**Note**: Only attempt this step if you have confirmed there is a working GPU/container/something that can run `torch 12.1` ready on your system.
+
+Now you will need to install the provided `requirements.txt` file:
+
+```bash
+pip install -r requirements.txt 
+```
+**Note**: It will fail for `torch 12.1` this is normal, it's hard to keep that command in `requirements.txt`. When it fails install it separately:
+
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
