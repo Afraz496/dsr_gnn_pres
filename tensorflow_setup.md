@@ -190,4 +190,38 @@ If it prints out the chart of GPUs on your system **in the container** we are lo
 1. Under VS Code choose the `Docker` icon on the left sidebar
 2. Choose the `+` icon next to `CONTAINERS` and pick `Open Folder in a Container`
 3. Navigate to the `.devcontainer` folder of your project and click `Open`
-4. 
+
+## Installing CUDA Drivers Locally
+
+Alternatively, you could set up an anaconda virtual environment and if you have a local GPU then you can follow these steps to install `CUDA` drivers. Note, this guide covers Windows, the Mac OS X and Linux installs are not covered but are actually easier.
+
+First download the version of `CUDA` compatible with this project: `CUDA 12.1` available on the [NVIDIA CUDA toolkit archive](https://developer.nvidia.com/cuda-12-1-0-download-archive). Follow all the steps and use `Express Installation` and leave every option on the default option.
+
+When that is done, press your Windows icon and search for `Environment Variables`, you should see an option to edit the environment variables. When that pops up click on `Environment Variables`, select `PATH` under `User Variables` and press `New`, then add **each** of these:
+
+```
+C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1\bin
+C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1\libnvvp
+```
+
+After that open `System Variables` and create a **new system variable** called `CUDA_HOME`. Paste the following in it:
+
+```
+C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1
+```
+
+Launch a terminal (preferably anaconda prompt) and confirm your driver is working:
+
+```bash
+nvcc --version
+```
+
+If it says `12.1` you are good to go.
+
+Additionally confirm GPU usage:
+
+```bash
+nvidia-smi
+```
+
+**Note**: This command will show a much higher version than what is installed, that is normal -> it is not indicative of the highest or lowest version supported, rather the version at the time this GPU was made.
