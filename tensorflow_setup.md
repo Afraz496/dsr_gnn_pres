@@ -238,3 +238,7 @@ pip install -r requirements.txt
 ```bash
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
+
+Then with your `torch geometric` installation there will be [1 issue](https://github.com/pyg-team/pytorch_geometric/discussions/9023). You will need to modify the import in your conda environment.
+
+
