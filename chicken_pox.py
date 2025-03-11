@@ -14,6 +14,19 @@ import dash_cytoscape as cyto
 import dash_leaflet as dl
 import datetime
 
+# Define a simple GNN model for predictions
+class GCNModel(torch.nn.Module):
+    def __init__(self, node_features, hidden_channels):
+        super(GCNModel, self).__init__()
+        self.conv1 = GCNConv(node_features, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, 1)
+
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = self.conv2(x, edge_index)
+        return x
+
 def normalize_coordinates(lat, lon, width=500, height=500):
     # Normalize latitude and longitude to fit in a given width and height
     min_lat, max_lat = 45.74, 48.58
@@ -51,11 +64,50 @@ def get_dataset_snapshots(dataset):
         snapshots.append(snapshot)
     return snapshots
 
+def train_gnn_model(dataset):
+    """Train a simple GNN model on the dataset"""
+    snapshots = get_dataset_snapshots(dataset)
+    train_split = int(len(snapshots) * 0.7)
+    
+    # Initialize model
+    node_features = snapshots[0].x.shape[1]
+    model = GCNModel(node_features=node_features, hidden_channels=32)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    
+    # Training loop
+    model.train()
+    for epoch in range(50):  # Train for 50 epochs
+        for i in range(train_split - 1):  # Use t to predict t+1
+            snapshot = snapshots[i]
+            y_true = snapshots[i+1].x[:, 0].reshape(-1, 1)  # Target is next snapshot's feature
+            
+            optimizer.zero_grad()
+            out = model(snapshot.x, snapshot.edge_index)
+            loss = F.mse_loss(out, y_true)
+            loss.backward()
+            optimizer.step()
+    
+    # Generate predictions for all snapshots
+    model.eval()
+    predictions = []
+    
+    with torch.no_grad():
+        for snapshot in snapshots:
+            pred = model(snapshot.x, snapshot.edge_index)
+            # Ensure predictions are non-negative
+            pred = torch.clamp(pred, min=0)
+            predictions.append(pred.numpy().flatten())
+    
+    return predictions
+
 def create_dashboard(dataset, raw_data):
     # Convert dataset to a list of snapshots for direct indexing
     snapshots = get_dataset_snapshots(dataset)
     total_steps = len(snapshots)
     
+    # Train model and get predictions
+    predictions = train_gnn_model(dataset)
+    print(predictions)
     app = dash.Dash(__name__)
     time_labels = generate_time_labels(start_year=2005, num_steps=total_steps)
 
@@ -72,7 +124,6 @@ def create_dashboard(dataset, raw_data):
                 dl.Map(
                     [
                         dl.TileLayer(url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"),
-                        # Use a LayerGroup instead of MarkerCluster
                         dl.LayerGroup(id='markers')
                     ],
                     center=[47.1625, 19.5033],
@@ -95,11 +146,15 @@ def create_dashboard(dataset, raw_data):
                             'style': {
                                 'label': 'data(label)',
                                 'background-color': 'data(color)',
-                                'font-size': '8px',
+                                'font-size': '14px',  # Increased font size
                                 'text-wrap': 'wrap',
-                                'width': '50px',
-                                'height': '50px',
-                                'padding': '8px'
+                                'width': '40px',      # Reduced node size
+                                'height': '40px',     # Reduced node size
+                                'padding': '8px',
+                                'text-valign': 'center',
+                                'text-halign': 'center',
+                                'text-outline-width': 1,
+                                'text-outline-color': '#FFFFFF'
                             }
                         },
                         {
@@ -120,15 +175,22 @@ def create_dashboard(dataset, raw_data):
             marks=time_slider_marks
         ),
 
-        html.Div(id='info-output', style={'marginTop': 20, 'fontSize': '16px'})
+        html.Div(id='info-output', style={'marginTop': 20, 'fontSize': '16px'}),
+        
+        # Add comparison graph
+        html.Div([
+            html.H3("County Case Comparison - Actual vs Predicted", style={'textAlign': 'center'}),
+            dcc.Graph(id='comparison-graph')
+        ], style={'marginTop': 30})
     ])
 
     @app.callback(
         [Output('cytoscape-graph', 'elements'),
-         Output('markers', 'children')],
+         Output('markers', 'children'),
+         Output('comparison-graph', 'figure')],
         Input('time-slider', 'value')
     )
-    def update_graph(time_index):
+    def update_visualization(time_index):
         snapshot = snapshots[time_index]
         
         # Get the original data for this time step from the raw dataset
@@ -147,6 +209,12 @@ def create_dashboard(dataset, raw_data):
         else:
             # Use a default or placeholder value
             true_cases = np.zeros(len(csv_counties))
+            
+        # Get predicted cases for this time step
+        if time_index < len(predictions):
+            predicted_cases = predictions[time_index]
+        else:
+            predicted_cases = np.zeros(len(csv_counties))
         
         # Create color mapping based on case counts
         max_cases = max(np.max(true_cases), 1)  # Prevent division by zero
@@ -166,14 +234,17 @@ def create_dashboard(dataset, raw_data):
         for i, county in enumerate(csv_counties):
             # Get true case count from raw data
             true_case_count = int(true_cases[i])
+            predicted_case_count = int(predicted_cases[i])
             color = get_color(true_case_count)
             
             # Create cytoscape node
             nodes.append({
                 'data': {
                     'id': county,
-                    'label': f'{county}\n{true_case_count} cases',
-                    'color': color
+                    'label': f'{county}\n{true_case_count}\nPred: {predicted_case_count}',
+                    'color': color,
+                    'true_cases': true_case_count,
+                    'predicted_cases': predicted_case_count
                 },
                 'position': positions[county]
             })
@@ -184,7 +255,7 @@ def create_dashboard(dataset, raw_data):
                 dl.Marker(
                     position=[lat, lon],
                     children=[
-                        dl.Tooltip(f"{county}: {true_case_count} cases")
+                        dl.Tooltip(f"{county}: {true_case_count} cases (Pred: {predicted_case_count})")
                     ]
                 )
             )
@@ -198,7 +269,7 @@ def create_dashboard(dataset, raw_data):
                     lat2, lon2 = county_coordinates[county2]
                     # Calculate distance
                     distance = ((lat1 - lat2)**2 + (lon1 - lon2)**2)**0.5
-                    # Connect nodes if they're close enough (threshold can be adjusted)
+                    # Connect nodes if they're close enough
                     if distance < 1.0:  # Approximately 100km
                         edges.append({
                             'data': {
@@ -207,7 +278,35 @@ def create_dashboard(dataset, raw_data):
                             }
                         })
         
-        return nodes + edges, markers
+        # Create comparison graph
+        comparison_figure = {
+            'data': [
+                {
+                    'x': csv_counties,
+                    'y': true_cases,
+                    'type': 'bar',
+                    'name': 'Actual Cases',
+                    'marker': {'color': 'rgb(255, 50, 50)'}
+                },
+                {
+                    'x': csv_counties,
+                    'y': predicted_cases,
+                    'type': 'bar',
+                    'name': 'Predicted Cases',
+                    'marker': {'color': 'rgb(50, 50, 255)'}
+                }
+            ],
+            'layout': {
+                'title': f'County Cases for {time_labels[time_index]}',
+                'xaxis': {'title': 'County', 'tickangle': 45},
+                'yaxis': {'title': 'Number of Cases'},
+                'barmode': 'group',
+                'legend': {'x': 0, 'y': 1.1, 'orientation': 'h'},
+                'margin': {'l': 50, 'r': 50, 'b': 100, 't': 50}
+            }
+        }
+        
+        return nodes + edges, markers, comparison_figure
 
     @app.callback(
         Output('info-output', 'children'),
@@ -219,8 +318,14 @@ def create_dashboard(dataset, raw_data):
 
         if node_data:
             county = node_data['id']
-            cases = node_data['label'].split('\n')[1].split(' ')[0]
-            return f"Current time: {current_time} | County: {county} | Reported cases: {cases}"
+            true_cases = node_data['true_cases']
+            predicted_cases = node_data['predicted_cases']
+            error = abs(true_cases - predicted_cases)
+            error_percent = (error / (true_cases + 1)) * 100  # Adding 1 to avoid division by zero
+            
+            return (f"Current time: {current_time} | County: {county} | "
+                    f"Actual cases: {true_cases} | Predicted cases: {predicted_cases} | "
+                    f"Error: {error:.1f} cases ({error_percent:.1f}%)")
 
         return f"Current time: {current_time} | Click on a county to see case details."
 
