@@ -173,3 +173,8 @@ cython_debug/
 # Data
 *.csv
 *.xlsx
+
+# Images and GIFs
+*.png
+*.jpg
+*.gif

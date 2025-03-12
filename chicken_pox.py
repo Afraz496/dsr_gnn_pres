@@ -3,7 +3,7 @@ import torch_geometric_temporal
 from torch_geometric_temporal.dataset import ChickenpoxDatasetLoader
 from torch_geometric_temporal.signal import temporal_signal_split
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv
+from torch_geometric_temporal.nn.recurrent import DCRNN
 import pandas as pd
 import numpy as np
 import networkx as nx
@@ -15,17 +15,25 @@ import dash_leaflet as dl
 import datetime
 
 # Define a simple GNN model for predictions
-class GCNModel(torch.nn.Module):
-    def __init__(self, node_features, hidden_channels):
-        super(GCNModel, self).__init__()
-        self.conv1 = GCNConv(node_features, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, 1)
-
-    def forward(self, x, edge_index):
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
-        x = self.conv2(x, edge_index)
-        return x
+class EnhancedRecurrentGCN(torch.nn.Module):
+    def __init__(self, node_features, hidden_dim=64):
+        super(EnhancedRecurrentGCN, self).__init__()
+        self.recurrent1 = DCRNN(node_features, hidden_dim, 1)
+        self.recurrent2 = DCRNN(hidden_dim, hidden_dim // 2, 1)
+        self.dropout = torch.nn.Dropout(0.2)
+        self.linear1 = torch.nn.Linear(hidden_dim // 2, 16)
+        self.linear2 = torch.nn.Linear(16, 1)
+        
+    def forward(self, x, edge_index, edge_weight):
+        h = self.recurrent1(x, edge_index, edge_weight)
+        h = F.relu(h)
+        h = self.recurrent2(h, edge_index, edge_weight)
+        h = F.relu(h)
+        h = self.dropout(h)
+        h = self.linear1(h)
+        h = F.relu(h)
+        h = self.linear2(h)
+        return h
 
 def normalize_coordinates(lat, lon, width=500, height=500):
     # Normalize latitude and longitude to fit in a given width and height
@@ -64,50 +72,314 @@ def get_dataset_snapshots(dataset):
         snapshots.append(snapshot)
     return snapshots
 
-def train_gnn_model(dataset):
-    """Train a simple GNN model on the dataset"""
+def create_scalers(dataset, raw_data, csv_counties):
+    """
+    Create scaling functions to convert between scaled and raw data values.
+    
+    Args:
+        dataset: The PyTorch Geometric Temporal dataset with scaled values
+        raw_data: DataFrame containing unscaled raw data
+        csv_counties: List of county names
+    
+    Returns:
+        scale_up_fn: Function to convert scaled predictions to raw scale
+        scale_down_fn: Function to convert raw values to the dataset scale
+    """
+    import numpy as np
+    
+    # Get first few snapshots from the dataset
+    snapshots = get_dataset_snapshots(dataset)
+    
+    # Extract scaled values for each county
+    scaled_values = []
+    for i, snapshot in enumerate(snapshots[:10]):  # Use first 10 snapshots
+        scaled_values.append(snapshot.x[:, 0].numpy())
+    
+    scaled_matrix = np.array(scaled_values)
+    
+    # Extract the corresponding raw values
+    # Create a mapping of dates to use for comparison
+    time_labels = generate_time_labels(start_year=2005, num_steps=len(snapshots))
+    
+    # Extract dates for the first 10 snapshots
+    dates = []
+    for i in range(10):
+        time_str = time_labels[i].split(' ')
+        month, year = time_str[0], int(time_str[1])
+        month_num = datetime.datetime.strptime(month, "%B").month
+        dates.append((year, month_num))
+    
+    # Get raw values for these dates
+    raw_values = []
+    for year, month in dates:
+        filtered_data = raw_data[
+            (raw_data['Date'].dt.year == year) & 
+            (raw_data['Date'].dt.month == month)
+        ]
+        
+        if not filtered_data.empty:
+            raw_values.append(filtered_data[csv_counties].values[0])
+        else:
+            # If no data for this date, use zeros
+            raw_values.append(np.zeros(len(csv_counties)))
+    
+    raw_matrix = np.array(raw_values)
+    
+    # Calculate scaling factors for each county
+    scaling_factors = []
+    scaling_offsets = []
+    
+    for county_idx in range(len(csv_counties)):
+        scaled_county_values = scaled_matrix[:, county_idx]
+        raw_county_values = raw_matrix[:, county_idx]
+        
+        # Avoid division by zero and use only non-zero entries
+        valid_indices = (scaled_county_values != 0) & (raw_county_values != 0)
+        
+        if np.sum(valid_indices) > 0:
+            # For each county, calculate average ratio between raw and scaled
+            ratios = raw_county_values[valid_indices] / scaled_county_values[valid_indices]
+            factor = np.median(ratios)  # Use median to be robust against outliers
+            
+            # Calculate typical offset (in case scaling is not just multiplication)
+            offsets = raw_county_values[valid_indices] - (scaled_county_values[valid_indices] * factor)
+            offset = np.median(offsets)
+        else:
+            # Default values if no valid data points
+            factor = 1.0
+            offset = 0.0
+            
+        scaling_factors.append(factor)
+        scaling_offsets.append(offset)
+    
+    # Create scaling functions
+    def scale_up_fn(scaled_predictions, county_idx=None):
+        """Convert scaled predictions to raw scale"""
+        if county_idx is not None:
+            # Scale for a specific county
+            return scaled_predictions * scaling_factors[county_idx] + scaling_offsets[county_idx]
+        else:
+            # Scale for all counties
+            return np.array([
+                scaled_predictions[i] * scaling_factors[i] + scaling_offsets[i]
+                for i in range(len(scaling_factors))
+            ])
+    
+    def scale_down_fn(raw_values, county_idx=None):
+        """Convert raw values to the dataset scale"""
+        if county_idx is not None:
+            # Only if scaling factor is not zero to avoid division by zero
+            if scaling_factors[county_idx] != 0:
+                return (raw_values - scaling_offsets[county_idx]) / scaling_factors[county_idx]
+            else:
+                return raw_values
+        else:
+            # Scale for all counties
+            return np.array([
+                (raw_values[i] - scaling_offsets[i]) / scaling_factors[i] 
+                if scaling_factors[i] != 0 else raw_values[i]
+                for i in range(len(scaling_factors))
+            ])
+    
+    return scale_up_fn, scale_down_fn, scaling_factors, scaling_offsets
+
+
+def train_gnn_model_with_scaling(dataset, raw_data, csv_counties):
+    """Train a GNN model on the dataset with validation and scale predictions"""
+    # First get the scalers
+    scale_up_fn, scale_down_fn, factors, offsets = create_scalers(dataset, raw_data, csv_counties)
+    
+    # Print scaling factors for debugging
+    print("Scaling factors:", factors)
+    print("Scaling offsets:", offsets)
+    
     snapshots = get_dataset_snapshots(dataset)
     train_split = int(len(snapshots) * 0.7)
+    val_split = int(len(snapshots) * 0.85)
     
-    # Initialize model
+    # Initialize enhanced model
     node_features = snapshots[0].x.shape[1]
-    model = GCNModel(node_features=node_features, hidden_channels=32)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    model = EnhancedRecurrentGCN(node_features=node_features)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, verbose=True
+    )
     
-    # Training loop
+    # Training loop with validation
+    best_val_loss = float('inf')
+    best_model_state = None
+    patience_counter = 0
+    max_patience = 15  # Early stopping
+    
     model.train()
-    for epoch in range(50):  # Train for 50 epochs
+    for epoch in range(200):  # More epochs
+        # Training phase
+        train_losses = []
         for i in range(train_split - 1):  # Use t to predict t+1
             snapshot = snapshots[i]
             y_true = snapshots[i+1].x[:, 0].reshape(-1, 1)  # Target is next snapshot's feature
             
             optimizer.zero_grad()
-            out = model(snapshot.x, snapshot.edge_index)
+            out = model(snapshot.x, snapshot.edge_index, snapshot.edge_weight)
             loss = F.mse_loss(out, y_true)
             loss.backward()
             optimizer.step()
+            train_losses.append(loss.item())
+        
+        # Validation phase
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for i in range(train_split, val_split - 1):
+                snapshot = snapshots[i]
+                y_true = snapshots[i+1].x[:, 0].reshape(-1, 1)
+                
+                out = model(snapshot.x, snapshot.edge_index, snapshot.edge_weight)
+                loss = F.mse_loss(out, y_true)
+                val_losses.append(loss.item())
+        
+        avg_train_loss = sum(train_losses) / len(train_losses)
+        avg_val_loss = sum(val_losses) / len(val_losses)
+        scheduler.step(avg_val_loss)
+        
+        # Print progress
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        
+        # Save best model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model_state = model.state_dict().copy()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        # Early stopping
+        if patience_counter >= max_patience:
+            print(f"Early stopping at epoch {epoch}")
+            break
     
-    # Generate predictions for all snapshots
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    
+    # Generate predictions (scaled)
+    model.eval()
+    scaled_predictions = []
+    raw_scale_predictions = []
+    
+    with torch.no_grad():
+        for snapshot in snapshots:
+            pred = model(snapshot.x, snapshot.edge_index, snapshot.edge_weight)
+            # Ensure predictions are non-negative
+            pred = torch.clamp(pred, min=0)
+            
+            # Get scaled predictions
+            scaled_pred = pred.numpy().flatten()
+            scaled_predictions.append(scaled_pred)
+            
+            # Transform to raw scale
+            raw_pred = scale_up_fn(scaled_pred)
+            raw_scale_predictions.append(raw_pred)
+    
+    return scaled_predictions, raw_scale_predictions, factors, offsets
+
+def train_gnn_model(dataset):
+    """Train a more sophisticated GNN model on the dataset with validation"""
+    snapshots = get_dataset_snapshots(dataset)
+    train_split = int(len(snapshots) * 0.7)
+    val_split = int(len(snapshots) * 0.85)
+    
+    # Initialize enhanced model
+    node_features = snapshots[0].x.shape[1]
+    model = EnhancedRecurrentGCN(node_features=node_features)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, verbose=True
+    )
+    
+    # Training loop with validation
+    best_val_loss = float('inf')
+    best_model_state = None
+    patience_counter = 0
+    max_patience = 15  # Early stopping
+    
+    model.train()
+    for epoch in range(200):  # More epochs
+        # Training phase
+        train_losses = []
+        for i in range(train_split - 1):  # Use t to predict t+1
+            snapshot = snapshots[i]
+            y_true = snapshots[i+1].x[:, 0].reshape(-1, 1)  # Target is next snapshot's feature
+            
+            optimizer.zero_grad()
+            out = model(snapshot.x, snapshot.edge_index, snapshot.edge_weight)
+            loss = F.mse_loss(out, y_true)
+            loss.backward()
+            optimizer.step()
+            train_losses.append(loss.item())
+        
+        # Validation phase
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for i in range(train_split, val_split - 1):
+                snapshot = snapshots[i]
+                y_true = snapshots[i+1].x[:, 0].reshape(-1, 1)
+                
+                out = model(snapshot.x, snapshot.edge_index, snapshot.edge_weight)
+                loss = F.mse_loss(out, y_true)
+                val_losses.append(loss.item())
+        
+        avg_train_loss = sum(train_losses) / len(train_losses)
+        avg_val_loss = sum(val_losses) / len(val_losses)
+        scheduler.step(avg_val_loss)
+        
+        # Print progress
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        
+        # Save best model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model_state = model.state_dict().copy()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        # Early stopping
+        if patience_counter >= max_patience:
+            print(f"Early stopping at epoch {epoch}")
+            break
+    
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    
+    # Generate predictions
     model.eval()
     predictions = []
     
     with torch.no_grad():
         for snapshot in snapshots:
-            pred = model(snapshot.x, snapshot.edge_index)
+            pred = model(snapshot.x, snapshot.edge_index, snapshot.edge_weight)
             # Ensure predictions are non-negative
             pred = torch.clamp(pred, min=0)
             predictions.append(pred.numpy().flatten())
     
     return predictions
 
-def create_dashboard(dataset, raw_data):
+def create_dashboard(dataset, raw_data, csv_counties):
     # Convert dataset to a list of snapshots for direct indexing
     snapshots = get_dataset_snapshots(dataset)
     total_steps = len(snapshots)
     
-    # Train model and get predictions
-    predictions = train_gnn_model(dataset)
-    print(predictions)
+    # Train model and get predictions - both scaled and raw
+    scaled_predictions, raw_scale_predictions, scaling_factors, scaling_offsets = train_gnn_model_with_scaling(dataset, raw_data, csv_counties)
+    
+    print("First few predictions (scaled):", scaled_predictions[0][:5])
+    print("First few predictions (raw scale):", raw_scale_predictions[0][:5])
+    
     app = dash.Dash(__name__)
     time_labels = generate_time_labels(start_year=2005, num_steps=total_steps)
 
@@ -146,10 +418,10 @@ def create_dashboard(dataset, raw_data):
                             'style': {
                                 'label': 'data(label)',
                                 'background-color': 'data(color)',
-                                'font-size': '14px',  # Increased font size
+                                'font-size': '14px',
                                 'text-wrap': 'wrap',
-                                'width': '40px',      # Reduced node size
-                                'height': '40px',     # Reduced node size
+                                'width': '40px',
+                                'height': '40px',
                                 'padding': '8px',
                                 'text-valign': 'center',
                                 'text-halign': 'center',
@@ -181,13 +453,20 @@ def create_dashboard(dataset, raw_data):
         html.Div([
             html.H3("County Case Comparison - Actual vs Predicted", style={'textAlign': 'center'}),
             dcc.Graph(id='comparison-graph')
-        ], style={'marginTop': 30})
+        ], style={'marginTop': 30}),
+        
+        # Display scaling info
+        html.Div([
+            html.H3("Scaling Factors", style={'textAlign': 'center'}),
+            html.Div(id='scaling-info')
+        ], style={'marginTop': 20})
     ])
 
     @app.callback(
         [Output('cytoscape-graph', 'elements'),
          Output('markers', 'children'),
-         Output('comparison-graph', 'figure')],
+         Output('comparison-graph', 'figure'),
+         Output('scaling-info', 'children')],
         Input('time-slider', 'value')
     )
     def update_visualization(time_index):
@@ -210,11 +489,15 @@ def create_dashboard(dataset, raw_data):
             # Use a default or placeholder value
             true_cases = np.zeros(len(csv_counties))
             
-        # Get predicted cases for this time step
-        if time_index < len(predictions):
-            predicted_cases = predictions[time_index]
+        # Get predicted cases for this time step (using raw scale predictions)
+        if time_index < len(raw_scale_predictions):
+            predicted_cases = raw_scale_predictions[time_index]
         else:
             predicted_cases = np.zeros(len(csv_counties))
+        
+        # Ensure predictions are integers
+        predicted_cases = np.round(predicted_cases).astype(int)
+        predicted_cases = np.maximum(predicted_cases, 0)  # Ensure no negative values
         
         # Create color mapping based on case counts
         max_cases = max(np.max(true_cases), 1)  # Prevent division by zero
@@ -306,7 +589,25 @@ def create_dashboard(dataset, raw_data):
             }
         }
         
-        return nodes + edges, markers, comparison_figure
+        # Create scaling info table
+        scaling_info = html.Table([
+            html.Thead(
+                html.Tr([
+                    html.Th("County"), 
+                    html.Th("Scaling Factor"), 
+                    html.Th("Offset")
+                ])
+            ),
+            html.Tbody([
+                html.Tr([
+                    html.Td(county),
+                    html.Td(f"{scaling_factors[i]:.2f}"),
+                    html.Td(f"{scaling_offsets[i]:.2f}")
+                ]) for i, county in enumerate(csv_counties)
+            ])
+        ], style={'width': '100%', 'border': '1px solid black', 'borderCollapse': 'collapse'})
+        
+        return nodes + edges, markers, comparison_figure, scaling_info
 
     @app.callback(
         Output('info-output', 'children'),
@@ -344,8 +645,8 @@ def main():
     loader = ChickenpoxDatasetLoader()
     dataset = loader.get_dataset()
     
-    # Create the dashboard with dataset snapshots
-    app = create_dashboard(dataset, raw_data)
+    # Create the dashboard with dataset snapshots and scaling
+    app = create_dashboard(dataset, raw_data, csv_counties)
     app.run_server(debug=True)
 
 if __name__ == "__main__":
