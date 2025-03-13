@@ -178,3 +178,7 @@ cython_debug/
 *.png
 *.jpg
 *.gif
+*~$*
+
+# catboost
+catboost_info/
