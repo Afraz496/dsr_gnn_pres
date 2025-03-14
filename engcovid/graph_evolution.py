@@ -43,24 +43,46 @@ def load_results():
         }
 
 # Load England geography data or generate mock graph
+
 def load_graph_data():
     try:
         # Try to load real geographic data
-        with open('england_regions.json', 'r') as f:
+        with open('england_covid.json', 'r') as f:
             region_data = json.load(f)
-        G = nx.Graph()
-        # Add nodes and edges based on real geography
-        # ...
+       
+        # Create a directed graph instead of undirected
+        G = nx.DiGraph()
+        # Add nodes and edges based on the edge_mapping
+        edge_index = region_data['edge_mapping']['edge_index']
+        edge_weight = region_data['edge_mapping']['edge_weight']
+       
+        # Adding edges with weights
+        for key, edges_list in edge_index.items():
+            weights = edge_weight[key]  # Get corresponding weights
+            
+            for i, edge in enumerate(edges_list):
+                source, target = edge  # Now explicitly source->target
+                weight = weights[i] if i < len(weights) else 1.0
+                G.add_edge(source, target, weight=weight)
+                
+        # Optionally, add positions to nodes if needed
+        for node in G.nodes():
+            if 'pos' not in G.nodes[node]:
+                G.nodes[node]['pos'] = (np.random.random(), np.random.random())
     except FileNotFoundError:
-        # Generate mock graph
+        # Generate mock graph if file is not found
         print("Geography data not found, generating mock graph")
-        G = nx.random_geometric_graph(129, 0.125)
+        # Create a directed geometric graph
+        G = nx.random_geometric_graph(129, 0.125, directed=True)
+        # Add random weights to edges
+        for u, v in G.edges():
+            G[u][v]['weight'] = np.random.random()
         # Add random positions if not created by the geometric graph
         for node in G.nodes():
             if 'pos' not in G.nodes[node]:
                 G.nodes[node]['pos'] = (np.random.random(), np.random.random())
+   
     return G
-
 # Get metrics
 def calculate_metrics(true_values, predictions):
     mse = np.mean((true_values - predictions) ** 2)
@@ -325,25 +347,44 @@ def update_graph(timestamp):
     # Normalize values for color mapping
     values = list(node_values.values())
     if not values:
-        # If no values for this timestamp, use defaults
         vmin, vmax = 0, 100
     else:
         vmin, vmax = min(values), max(values)
     
-    # Create edges trace
-    edge_x = []
-    edge_y = []
-    for edge in graph.edges():
-        x0, y0 = pos[edge[0]]
-        x1, y1 = pos[edge[1]]
-        edge_x.extend([x0, x1, None])
-        edge_y.extend([y0, y1, None])
+    # Create separate edge traces for different weights
+    edge_traces = []
+    
+    # Get min and max weights for normalization
+    weights = [graph[u][v].get('weight', 1.0) for u, v in graph.edges()]
+    min_weight = min(weights) if weights else 0.1
+    max_weight = max(weights) if weights else 1.0
+    
+    # Group edges by weight ranges for visualization
+    weight_ranges = 5  # Number of different line widths
+    
+    for i in range(weight_ranges):
+        lower = min_weight + (max_weight - min_weight) * i / weight_ranges
+        upper = min_weight + (max_weight - min_weight) * (i + 1) / weight_ranges
+        width = 0.5 + (i * 0.6)  # Width increases with weight range
         
-    edge_trace = go.Scatter(
-        x=edge_x, y=edge_y,
-        line=dict(width=0.5, color='#888'),
-        hoverinfo='none',
-        mode='lines')
+        edge_x = []
+        edge_y = []
+        
+        for edge in graph.edges():
+            weight = graph[edge[0]][edge[1]].get('weight', 1.0)
+            if lower <= weight <= upper or (i == weight_ranges - 1 and weight == max_weight):
+                x0, y0 = pos[edge[0]]
+                x1, y1 = pos[edge[1]]
+                edge_x.extend([x0, x1, None])
+                edge_y.extend([y0, y1, None])
+        
+        if edge_x:  # Only add trace if there are edges in this range
+            edge_traces.append(go.Scatter(
+                x=edge_x, y=edge_y,
+                line=dict(width=width, color=f'rgba(70,130,180,{0.4 + i * 0.1})'),
+                hoverinfo='none',
+                mode='lines'
+            ))
     
     # Create nodes trace
     node_x = []
@@ -373,18 +414,17 @@ def update_graph(timestamp):
                 thickness=15,
                 title='Value',
                 xanchor='left'
-                # Removed titleside parameter that was causing the error
             ),
             line_width=2,
             cmin=vmin,
             cmax=vmax
         ))
     
-    # Create figure
-    fig = go.Figure(data=[edge_trace, node_trace],
+    # Create figure with all traces
+    fig = go.Figure(data=edge_traces + [node_trace],
                 layout=go.Layout(
                     title=dict(
-                        text=f'England COVID-19 Graph at Timestamp {timestamp}', 
+                        text=f'England COVID-19 Graph at Timestamp {timestamp} (Edge Thickness = Weight)', 
                         font=dict(size=16)
                     ),
                     showlegend=False,
@@ -396,6 +436,7 @@ def update_graph(timestamp):
                 ))
     
     return fig
+
 
 
 @app.callback(
