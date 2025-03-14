@@ -1,4 +1,4 @@
-# TemporaL Graph Neural Network demo
+# Temporal Graph Neural Networks
 
 This repo houses a lot of code to help you in your tGNN endeavors! 
 
