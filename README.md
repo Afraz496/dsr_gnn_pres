@@ -32,4 +32,4 @@ python encovid_dashboard.py
 
 ### Using torch geometric with your own data
 
-I have composed a function which you can adapt to use on your own datasets to make a torch geometric temporal friendly dataset available [here]()
+I have composed a function which you can adapt to use on your own datasets to make a torch geometric temporal friendly dataset available [here](https://github.com/Afraz496/dsr_gnn_pres/blob/main/use_for_custom_data.py)
