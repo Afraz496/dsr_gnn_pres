@@ -395,4 +395,4 @@ def update_top_areas_performance(selected_timestamp):
 
 # Run the app
 if __name__ == "__main__":
-    app.run_server(debug=True)
+    app.run(debug=True)
